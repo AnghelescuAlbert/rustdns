@@ -1,4 +1,4 @@
-use std::error::Error;
+use std::{error::Error, net::Ipv4Addr};
 
 use crate::{header::DnsHeader, record::{DnsQuestion, DnsRecord, QueryType}};
 
@@ -54,6 +54,92 @@ impl DnsPacket {
 
         Ok(result)
     }
+
+    pub fn write(&mut self, buffer: &mut BytePacketBuffer) -> Result<(), Box<dyn Error>> {
+        self.header.questions = self.questions.len() as u16;
+        self.header.answers = self.answers.len() as u16;
+        self.header.authoritative_entries = self.authorities.len() as u16;
+        self.header.resource_entries = self.resources.len() as u16;
+
+        self.header.write(buffer)?;
+
+        for question in &self.questions {
+            question.write(buffer)?;
+        }
+
+        for rec in &self.answers {
+            rec.write(buffer)?;
+        }
+
+        for rec in &self.authorities {
+            rec.write(buffer)?;
+        }
+
+        for rec in &self.resources {
+            rec.write(buffer)?;
+        }
+
+        Ok(())
+    }
+
+    /// It's useful to be able to pick a random A record from a packet.
+    /// When we get multiple IP's for a single name.
+    pub fn get_random_a(&self) -> Option<Ipv4Addr> {
+        self.answers
+            .iter()
+            .filter_map(|record| match record {
+                DnsRecord::A {addr, .. } => Some(*addr),
+                _ => None,
+            })
+            .next()
+    }
+
+    /// A helper function which returns an iterator over all name servers in
+    /// the authorities section, represented as (domain, host) tuples
+    fn get_ns<'a>(&'a self, qname: &'a str) -> impl Iterator<Item = (&'a str, &'a str)> {
+        self.authorities
+            .iter()
+            // In practice, these are always NS records in well formed packages.
+            // Convert the NS records to a tuple which has only the data we need
+            // to make it easy to work with.
+            .filter_map(|record| match record {
+                DnsRecord::NS {domain, host, .. } => Some((domain.as_str(), host.as_str())),
+                _ => None,
+            })
+            // Discard servers which aren't authoritative to our query
+            .filter(move |(domain, _)| qname.ends_with(*domain))
+    }
+
+    /// We'll use the fact that name servers often bundle the corresponding
+    /// A records when replying to an NS query to implement a function that
+    /// returns the actual IP for an NS record if possible.
+    pub fn get_resolved_ns(&self, qname: &str) -> Option<Ipv4Addr> {
+        // Get an iterator over the nameservers in the authorities section
+        self.get_ns(qname)
+            // Now we need to look for a matching A record in the additional
+            // section. Since we just want the first valid record, we can just
+            // build a stream of matching records.
+            .flat_map(|(_, host)| {
+                self.resources
+                    .iter()
+                    // Filter for A records where the domain match the host
+                    // of the NS record that we are currently processing
+                    .filter_map(move |record| match record {
+                        DnsRecord::A {domain, addr, .. } if domain == host => Some(addr),
+                        _ => None,
+                    })
+            })
+            .map(|addr| *addr)
+            .next()
+    }
+
+    ///In certain cases there won't be any A records in the additional section,
+    /// and we'all have to perform another lookup.
+    pub fn get_unresolved_ns<'a>(&'a self, qname: &'a str) -> Option<&'a str> {
+        self.get_ns(qname)
+            .map(|(_, host)| host)
+            .next()
+    }
 }
 
 impl BytePacketBuffer {
@@ -66,7 +152,7 @@ impl BytePacketBuffer {
     }
 
     /// Current position within buffer
-    fn pos(&self) -> usize {
+    pub fn pos(&self) -> usize {
         self.pos
     }
 
@@ -103,7 +189,7 @@ impl BytePacketBuffer {
     }
 
     /// Get a range of bytes
-    fn get_range(&mut self, start: usize, len: usize)
+    pub fn get_range(&mut self, start: usize, len: usize)
     -> Result<&[u8], Box<dyn Error>> {
         if start + len >= 512 {
             return Err("End of buffer".into());
@@ -208,6 +294,69 @@ impl BytePacketBuffer {
         if !jumped {
             self.seek(pos)?;
         }
+
+        Ok(())
+    }
+
+    fn write(&mut self, val: u8) -> Result<(), Box<dyn Error>> {
+        if self.pos >= 512 {
+            return Err("End of buffer".into());
+        }
+        self.buf[self.pos] = val;
+        self.pos += 1;
+        Ok(())
+    }
+
+    pub fn write_u8(&mut self, val: u8) -> Result<(), Box<dyn Error>> {
+        self.write(val)?;
+
+        Ok(())
+    }
+
+    pub fn write_u16(&mut self, val: u16) -> Result<(), Box<dyn Error>> {
+        self.write((val >> 8) as u8)?;
+        self.write((val & 0xFF) as u8)?;
+
+        Ok(())
+    }
+
+    pub fn write_u32(&mut self, val: u32) -> Result<(), Box<dyn Error>> {
+        self.write(((val >> 24) & 0xFF) as u8)?;
+        self.write(((val >> 16) & 0xFF) as u8)?;
+        self.write(((val >> 8) & 0xFF) as u8)?;
+        self.write(((val >> 0) & 0xFF) as u8)?;
+
+        Ok(()) 
+    }
+
+    pub fn write_qname(&mut self, qname: &str) -> Result<(), Box<dyn Error>> {
+        for label in qname.split('.') {
+            let len = label.len();
+            if len > 0x3f {
+                return Err("Single label exceeds 63 characters of length.".into());
+            }
+
+            self.write_u8(len as u8)?;
+
+            for b in label.as_bytes() {
+                self.write_u8(*b)?;
+            }
+        }
+
+        self.write_u8(0)?;
+
+        Ok(())
+    }
+
+    pub fn set(&mut self, pos: usize, val: u8) -> Result<(), Box<dyn Error>> {
+        self.buf[pos] = val;
+
+        Ok(())
+    }
+
+    pub fn set_u16(&mut self, pos: usize, val: u16) -> Result<(), Box<dyn Error>> {
+        self.set(pos, (val >> 8) as u8)?;
+        self.set(pos + 1, (val & 0xFF) as u8)?;
 
         Ok(())
     }

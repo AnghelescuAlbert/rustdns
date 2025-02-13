@@ -9,7 +9,7 @@ mod header;
 mod record;
 
 fn main() -> Result<(), Box<dyn Error>> {
-    let mut f = File::open("test/query_packet.txt")?;
+    let mut f = File::open("test/response_packet.txt")?;
     let mut buffer = BytePacketBuffer::new();
     f.read(&mut buffer.buf)?;
 
